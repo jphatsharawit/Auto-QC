@@ -44,14 +44,43 @@ except ImportError as e:
 ENHANCE_AUDIO = True
 
 # IQR Outlier Detection
-IQR_MULTIPLIER     = 1.5   # Tukey standard; raise to 2.0–2.5 to be less aggressive
 MIN_AUDIO_DURATION = 0.5   # seconds — shorter recordings auto-FAIL without IQR
+
+# Hard absolute rate bounds — applied before any IQR (physically impossible rates)
+HARD_MIN_RATE = 0.5   # syll/sec — below this is always Too Slow regardless of speaker
+HARD_MAX_RATE = 12.0  # syll/sec — above this is always Too Fast regardless of email type
+
+# New style-based buckets
+NEW_BUCKETS = ['spelling', 'reading_short', 'reading_medium', 'reading_long']
+
+SPELLING_TOKENS = {
+    'เอ', 'บี', 'ซี', 'ดี', 'อี', 'เอฟ', 'จี', 'เอช', 'เฮช', 'ไอ', 'เจ', 'เค', 'แอล', 
+    'เอ็ม', 'เอ็น', 'โอ', 'พี', 'คิว', 'อาร์', 'เอส', 'ที', 'ยู', 'วี', 'ดับบลิว', 
+    'ดับเบิ้ลยู', 'เอ็กซ์', 'วาย', 'แซด', 'จุด', 'ขีด', 'ขีดล่าง', 'อันเดอร์สกอร์', 'ไฮเฟน'
+}
+
+def classify_style(text):
+    if pd.isna(text):
+        return 'reading'
+    words = str(text).split()
+    if not words:
+        return 'reading'
+    spelling_words = [w for w in words if w in SPELLING_TOKENS or len(w) == 1]
+    ratio = len(spelling_words) / len(words)
+    return 'spelling' if ratio > 0.4 else 'reading'
+
+# Log-IQR multiplier for bucket-level global bounds (wider = less aggressive)
+BUCKET_IQR_MULTIPLIER = 2.0
+
+# Per-speaker IQR multiplier within same bucket (wider than bucket to reduce false positives)
+SPEAKER_IQR_MULTIPLIER = 2.5
+MIN_SPEAKER_BUCKET_SAMPLES = 20  # minimum samples in a bucket for per-speaker IQR to apply
 
 # AI Recovery (Whisper + MiniLM)
 # Binary scoring:
 #   score >= AI_CONFIDENT_THRESHOLD → PASS (AI Recovered)      auto-pass
 #   score <  AI_CONFIDENT_THRESHOLD → FAIL
-AI_CONFIDENT_THRESHOLD  = 80.0  # score needed for auto-pass
+AI_CONFIDENT_THRESHOLD  = 70.0  # score needed for auto-pass (lowered from 80 — borderline phonetic matches are close enough)
 
 def get_audio_duration(url):
     """Get audio duration using ffprobe without downloading the whole file."""
@@ -69,13 +98,62 @@ def get_audio_duration(url):
         pass
     return None
 
+def get_trimmed_duration_remote(url):
+    """Fetch active speech duration directly from S3 URL using ffmpeg silenceremove."""
+    if pd.isna(url) or not url:
+        return None
+    try:
+        silence_filter = (
+            "silenceremove=start_periods=1:start_silence=0.3:start_threshold=-40dB"
+            ",areverse"
+            ",silenceremove=start_periods=1:start_silence=0.3:start_threshold=-40dB"
+            ",areverse"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-i", str(url),
+            "-af", silence_filter,
+            "-f", "null", "-"
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
+        if result.returncode == 0:
+            import re
+            matches = re.findall(r'time=(\d+):(\d+):(\d+\.\d+)', result.stderr)
+            if matches:
+                h, m, s = matches[-1]
+                duration = float(h) * 3600 + float(m) * 60 + float(s)
+                return duration
+    except Exception:
+        pass
+    return None
+
+def get_syl_bucket(row):
+    """Map script style and syllable count to bucket label."""
+    text = row.get('text', '')
+    syl = row.get('syllable_count', 0)
+    style = classify_style(text)
+    if style == 'spelling':
+        return 'spelling'
+    else:
+        if syl <= 8:
+            return 'reading_short'
+        elif syl <= 15:
+            return 'reading_medium'
+        else:
+            return 'reading_long'
+
+
 def count_syllables(text):
-    """Count syllables in Thai text using PyThaiNLP."""
+    """Count syllables in Thai text using PyThaiNLP, ignoring spaces and punctuation."""
     if pd.isna(text) or not str(text).strip():
         return 0
-    # pythainlp's syllable_tokenize returns a list of syllables
-    syllables = syllable_tokenize(str(text))
-    return len(syllables)
+    import re
+    # 1. Clean punctuation (replace with space)
+    cleaned = re.sub(r'[^\u0e00-\u0e7fA-Za-z0-9\s]', ' ', str(text))
+    # 2. Tokenize using PyThaiNLP
+    raw_tokens = syllable_tokenize(cleaned)
+    # 3. Filter out whitespace and any punctuation/special characters tokens
+    filtered_tokens = [t for t in raw_tokens if re.search(r'[\u0e00-\u0e7fA-Za-z0-9]', t)]
+    return len(filtered_tokens)
 
 def process_durations_multithreaded(df, max_workers=20, cache_file='data/duration_cache.json'):
     """Fetch audio durations with multithreading and caching."""
@@ -125,7 +203,7 @@ def process_durations_multithreaded(df, max_workers=20, cache_file='data/duratio
 
 
 
-def run_pipeline(input_csv, max_workers=20, is_test_mode=False, sample=None):
+def run_pipeline(input_csv, max_workers=20, is_test_mode=False, sample=None, enable_ai_recovery=True, bucket_iqr_multiplier=2.0, speaker_iqr_multiplier=2.5):
     print("="*70)
     print("Starting IQR Audio QC Pipeline")
     print("="*70, flush=True)
@@ -182,6 +260,7 @@ def run_pipeline(input_csv, max_workers=20, is_test_mode=False, sample=None):
     df['outlier_type'] = 'Normal'
     df['final_status'] = 'PASS'
     df['ai_score'] = np.nan
+    df['syl_bucket'] = df.apply(get_syl_bucket, axis=1)
 
     # Auto-fail rows with no reference text — nothing to compare against
     no_text_idx = df[df['text'].isna() | (df['text'].astype(str).str.strip() == '')].index
@@ -190,23 +269,15 @@ def run_pipeline(input_csv, max_workers=20, is_test_mode=False, sample=None):
         df.loc[no_text_idx, 'final_status'] = 'FAIL'
         print(f"Auto-failed {len(no_text_idx)} rows with missing reference text (No Script)", flush=True)
 
-    # Compute global IQR bounds as fallback for speakers with too few samples
-    all_rates = df['speech_rate'].dropna()
-    if len(all_rates) >= 4:
-        _gq1 = all_rates.quantile(0.25)
-        _gq3 = all_rates.quantile(0.75)
-        _giqr = _gq3 - _gq1
-        global_too_fast = _gq3 + IQR_MULTIPLIER * _giqr
-        global_too_slow = max(0.0, _gq1 - IQR_MULTIPLIER * _giqr)
-    else:
-        global_too_fast = 8.0
-        global_too_slow = 0.5
-    print(f"Global IQR bounds (\u00d7{IQR_MULTIPLIER}): too_slow < {global_too_slow:.2f} | too_fast > {global_too_fast:.2f} syll/sec", flush=True)
-
-    # Group by user_id
-    speaker_groups = df.groupby('user_id')
-
     outlier_count = 0
+
+    # Auto-fail rows with missing duration (broken link or corrupted audio)
+    missing_dur_idx = df[df['audio_duration'].isna()].index
+    if len(missing_dur_idx) > 0:
+        df.loc[missing_dur_idx, 'outlier_type'] = 'Duration Error'
+        df.loc[missing_dur_idx, 'final_status'] = 'FAIL'
+        outlier_count += len(missing_dur_idx)
+        print(f"Auto-failed {len(missing_dur_idx)} rows due to missing/corrupted duration (Duration Error)", flush=True)
 
     # Auto-fail recordings that are suspiciously short (likely incomplete captures)
     short_dur_idx = df[
@@ -218,45 +289,186 @@ def run_pipeline(input_csv, max_workers=20, is_test_mode=False, sample=None):
         outlier_count += len(short_dur_idx)
         print(f"Auto-failed {len(short_dur_idx)} recordings under {MIN_AUDIO_DURATION}s (Too Short)", flush=True)
 
-    for speaker, group in speaker_groups:
-        # Skip rows already FAIL (e.g. Too Short) so IQR only sees PASS candidates
-        valid_group = group[group['final_status'] == 'PASS']
-        if valid_group.empty:
-            continue
-        rates = valid_group['speech_rate'].dropna()
-        if len(rates) < 4:
-            # Too few samples for per-speaker IQR — use global bounds as fallback
-            fast_idx = valid_group[valid_group['speech_rate'] > global_too_fast].index
-            slow_idx = valid_group[valid_group['speech_rate'] < global_too_slow].index
-            df.loc[fast_idx, 'outlier_type'] = 'Too Fast'
-            df.loc[slow_idx, 'outlier_type'] = 'Too Slow'
-            df.loc[fast_idx, 'final_status'] = 'FAIL'
-            df.loc[slow_idx, 'final_status'] = 'FAIL'
-            outlier_count += len(fast_idx) + len(slow_idx)
-            continue
+    # --- Step 1: Hard absolute rate bounds (physically impossible values) ---
+    # Applied only to PASS records with a valid speech rate
+    pass_mask = (df['final_status'] == 'PASS') & df['speech_rate'].notna()
+    hard_fast_idx = df[pass_mask & (df['speech_rate'] > HARD_MAX_RATE)].index
+    hard_slow_idx = df[pass_mask & (df['speech_rate'] < HARD_MIN_RATE)].index
+    df.loc[hard_fast_idx, 'outlier_type'] = 'Too Fast'
+    df.loc[hard_slow_idx, 'outlier_type'] = 'Too Slow'
+    df.loc[hard_fast_idx.union(hard_slow_idx), 'final_status'] = 'FAIL'
+    outlier_count += len(hard_fast_idx) + len(hard_slow_idx)
+    print(f"Hard bounds (< {HARD_MIN_RATE} or > {HARD_MAX_RATE} syll/sec): {len(hard_fast_idx)} too fast, {len(hard_slow_idx)} too slow", flush=True)
 
-        q1 = rates.quantile(0.25)
-        q3 = rates.quantile(0.75)
-        iqr = q3 - q1
-
-        too_fast_threshold = q3 + IQR_MULTIPLIER * iqr
-        too_slow_threshold = q1 - IQR_MULTIPLIER * iqr
-
-        # Apply bounds
-        fast_idx = valid_group[valid_group['speech_rate'] > too_fast_threshold].index
-        slow_idx = valid_group[valid_group['speech_rate'] < too_slow_threshold].index
-
-        df.loc[fast_idx, 'outlier_type'] = 'Too Fast'
-        df.loc[slow_idx, 'outlier_type'] = 'Too Slow'
-        df.loc[fast_idx, 'final_status'] = 'FAIL'
-        df.loc[slow_idx, 'final_status'] = 'FAIL'
-
-        outlier_count += (len(fast_idx) + len(slow_idx))
-        
-    print(f"Warning: Found {outlier_count} speed outliers across {len(speaker_groups)} speakers.", flush=True)
+    # --- Step 2: Global log-IQR per bucket & Speaker-level Shrunken Z-score ---
+    # We will compute bounds on the PASS records
+    valid_mask = (df['final_status'] == 'PASS') & df['speech_rate'].notna() & (df['speech_rate'] > 0)
+    df['log_rate'] = np.log(df['speech_rate'])
     
+    # Calculate global IQR bounds for each bucket
+    bucket_bounds = {}
+    print(f"\nBucket-stratified log-IQR (x{bucket_iqr_multiplier}) bounds:", flush=True)
+    for label in NEW_BUCKETS:
+        bucket_mask = valid_mask & (df['syl_bucket'] == label)
+        rates = df[bucket_mask]['speech_rate']
+        if len(rates) >= 10:
+            log_rates = np.log(rates)
+            q1 = log_rates.quantile(0.25)
+            q3 = log_rates.quantile(0.75)
+            iqr = q3 - q1
+            lower = np.exp(q1 - bucket_iqr_multiplier * iqr)
+            upper = np.exp(q3 + bucket_iqr_multiplier * iqr)
+        else:
+            lower, upper = HARD_MIN_RATE, HARD_MAX_RATE
+        bucket_bounds[label] = (lower, upper)
+        print(f"  {label:15s} (n={len(rates):5d}): {lower:.2f} - {upper:.2f} syll/sec", flush=True)
+
+    # Calculate global parameters for Z-score
+    global_stats = {}
+    for label in NEW_BUCKETS:
+        bucket_mask = valid_mask & (df['syl_bucket'] == label)
+        rates = df[bucket_mask]['log_rate']
+        if len(rates) > 2:
+            global_stats[label] = {'mean': rates.mean(), 'std': max(rates.std(), 0.05)}
+        else:
+            global_stats[label] = {'mean': np.log(2.0), 'std': 0.3}
+
+    # Calculate speaker statistics per bucket
+    speaker_stats = {}
+    for (speaker, label), group in df[valid_mask].groupby(['user_id', 'syl_bucket']):
+        log_rates = group['log_rate']
+        n = len(log_rates)
+        m = log_rates.mean()
+        s = log_rates.std() if n > 1 else 0.0
+        speaker_stats[(speaker, label)] = {'n': n, 'mean': m, 'std': s}
+
+    # Compute shrunken Z-score for all valid rows
+    # Shrinkage priors: K_m=5.0, K_v=5.0
+    K_m, K_v = 5.0, 5.0
+    df['z_score'] = np.nan
+    for idx, row in df[valid_mask].iterrows():
+        speaker = row['user_id']
+        bucket = row['syl_bucket']
+        g_mean = global_stats[bucket]['mean']
+        g_std = global_stats[bucket]['std']
+        
+        spk_info = speaker_stats.get((speaker, bucket), {'n': 0, 'mean': g_mean, 'std': g_std})
+        n = spk_info['n']
+        m = spk_info['mean']
+        s = spk_info['std']
+        
+        mu_shrunken = (n * m + K_m * g_mean) / (n + K_m)
+        if n > 1:
+            s_raw_var = (n / (n - 1)) * (s ** 2)
+            var_shrunken = ((n - 1) * s_raw_var + K_v * (g_std ** 2)) / ((n - 1) + K_v)
+            std_shrunken = np.sqrt(var_shrunken)
+        else:
+            std_shrunken = g_std
+            
+        std_shrunken = max(std_shrunken, 0.05)
+        z = (row['log_rate'] - mu_shrunken) / std_shrunken
+        df.loc[idx, 'z_score'] = z
+
+    # Outlier criteria: Outside Global bounds AND Speaker Z-score > speaker_iqr_multiplier
+    df['is_global_outlier'] = False
+    for label, (lower, upper) in bucket_bounds.items():
+        b_mask = valid_mask & (df['syl_bucket'] == label)
+        df.loc[b_mask & ((df['speech_rate'] < lower) | (df['speech_rate'] > upper)), 'is_global_outlier'] = True
+
+    # speaker_iqr_multiplier is repurposed as z_thresh
+    z_thresh = speaker_iqr_multiplier
+    initial_outliers_idx = df[valid_mask & df['is_global_outlier'] & (df['z_score'].abs() > z_thresh)].index
+
+    for idx in initial_outliers_idx:
+        row = df.loc[idx]
+        bucket = row['syl_bucket']
+        lower, upper = bucket_bounds[bucket]
+        if row['speech_rate'] < lower:
+            df.loc[idx, 'outlier_type'] = 'Too Slow'
+        else:
+            df.loc[idx, 'outlier_type'] = 'Too Fast'
+        df.loc[idx, 'final_status'] = 'FAIL'
+
+    # Count outliers so far (excluding No Script)
+    outlier_count = len(df[(df['final_status'] == 'FAIL') & (~df['outlier_type'].isin(['No Script']))])
+
+    # --- Active Speech Verification (On-Demand Silence Trim) for outliers ---
+    speed_outliers_mask = (df['final_status'] == 'FAIL') & df['outlier_type'].isin(['Too Fast', 'Too Slow'])
+    speed_outliers = df[speed_outliers_mask]
+    if len(speed_outliers) > 0:
+        print(f"\n🔍 Verifying {len(speed_outliers)} speed outliers using active speech duration...", flush=True)
+        trimmed_durations = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_idx = {
+                executor.submit(get_trimmed_duration_remote, row.get('audio', row.get('audiourl', ''))): idx
+                for idx, row in speed_outliers.iterrows()
+                if row.get('audio', row.get('audiourl', '')) and not pd.isna(row.get('audio', row.get('audiourl', '')))
+            }
+            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc="Trimming Silences"):
+                idx = future_to_idx[future]
+                try:
+                    trimmed_durations[idx] = future.result()
+                except Exception:
+                    trimmed_durations[idx] = None
+
+        # Apply trimmed duration and re-evaluate
+        recovered_count = 0
+        for idx, row in speed_outliers.iterrows():
+            trimmed_dur = trimmed_durations.get(idx, None)
+            if trimmed_dur is not None and trimmed_dur > 0.5:
+                new_rate = row['syllable_count'] / trimmed_dur
+                bucket = row['syl_bucket']
+                lower, upper = bucket_bounds[bucket]
+                
+                is_ok_global = (lower <= new_rate <= upper)
+                
+                speaker = row['user_id']
+                g_mean = global_stats[bucket]['mean']
+                g_std = global_stats[bucket]['std']
+                
+                spk_info = speaker_stats.get((speaker, bucket), {'n': 0, 'mean': g_mean, 'std': g_std})
+                n = spk_info['n']
+                m = spk_info['mean']
+                s = spk_info['std']
+                
+                mu_shrunken = (n * m + K_m * g_mean) / (n + K_m)
+                if n > 1:
+                    s_raw_var = (n / (n - 1)) * (s ** 2)
+                    var_shrunken = ((n - 1) * s_raw_var + K_v * (g_std ** 2)) / ((n - 1) + K_v)
+                    std_shrunken = np.sqrt(var_shrunken)
+                else:
+                    std_shrunken = g_std
+                std_shrunken = max(std_shrunken, 0.05)
+                
+                new_log_rate = np.log(new_rate)
+                new_z = (new_log_rate - mu_shrunken) / std_shrunken
+                
+                is_ok_speaker = (abs(new_z) <= z_thresh)
+                
+                if is_ok_global or is_ok_speaker:
+                    df.loc[idx, 'audio_duration'] = trimmed_dur
+                    df.loc[idx, 'speech_rate'] = new_rate
+                    df.loc[idx, 'outlier_type'] = 'Normal'
+                    df.loc[idx, 'final_status'] = 'PASS'
+                    recovered_count += 1
+                else:
+                    # Still fail, but update rate to the trimmed one
+                    df.loc[idx, 'audio_duration'] = trimmed_dur
+                    df.loc[idx, 'speech_rate'] = new_rate
+            elif trimmed_dur is not None and trimmed_dur <= 0.5:
+                df.loc[idx, 'outlier_type'] = 'Too Short'
+                df.loc[idx, 'final_status'] = 'FAIL'
+                
+        print(f"✅ Active Speech Verification completed: Recovered {recovered_count} false outliers!", flush=True)
+        # Recalculate outlier_count
+        outlier_count = len(df[(df['final_status'] == 'FAIL') & (~df['outlier_type'].isin(['No Script']))])
+
+
     # 4. AI-Assisted Transcription for Outliers
-    if outlier_count > 0:
+    if not enable_ai_recovery:
+        if outlier_count > 0:
+            print(f"\nAI Recovery (Whisper fallback) is disabled. {outlier_count} outliers will remain FAIL.", flush=True)
+    elif outlier_count > 0:
         print(f"\nLoading Whisper model once for {outlier_count} outliers...", flush=True)
         whisper_model = load_whisper_model()
 
@@ -352,10 +564,22 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, default="data/Email1.csv", help="Path to input CSV data")
     parser.add_argument("--workers", type=int, default=20, help="Number of multithreading workers for duration fetching")
     parser.add_argument("--test", action="store_true", help="Run on a small subset of 50 rows for testing")
-    
     parser.add_argument("--sample", type=int, default=None, help="Limit to first N rows (e.g. 1000 for sampling)")
+    
+    # New options
+    parser.add_argument("--no-ai", action="store_true", help="Bypass AI/Whisper recovery phase")
+    parser.add_argument("--bucket-iqr", type=float, default=2.0, help="Global bucket IQR multiplier (default: 2.0)")
+    parser.add_argument("--speaker-iqr", type=float, default=2.5, help="Per-speaker Z-score threshold (default: 2.5)")
     
     args = parser.parse_args()
     
     # Note: If testing mode is enabled, we could modify run_pipeline to accept it
-    run_pipeline(args.input, args.workers, args.test, args.sample)
+    run_pipeline(
+        args.input, 
+        max_workers=args.workers, 
+        is_test_mode=args.test, 
+        sample=args.sample,
+        enable_ai_recovery=not args.no_ai,
+        bucket_iqr_multiplier=args.bucket_iqr,
+        speaker_iqr_multiplier=args.speaker_iqr
+    )

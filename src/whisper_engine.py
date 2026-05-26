@@ -87,46 +87,47 @@ def transcribe_with_model(model, audio_path: str, ref_text: str) -> dict:
     No file I/O side-effects — returns comparison dict directly.
     Call load_whisper_model() once and pass the model here for each file.
 
-    Uses only a generic email-context initial_prompt (no script injection,
-    no hotwords). Injecting the actual script caused Whisper to hallucinate
-    the reference verbatim regardless of what was spoken, inflating scores
-    to 100% for mismatched recordings.  Discrimination is handled entirely
-    by the normalize+hybrid-fuzzy scorer instead.
+    Uses an expanded email-context initial_prompt, reference-based hotwords,
+    and a dual-temperature retry mechanism (first temperature=0, retry 0.2 if score < 70).
     """
     initial_prompt = (
-        "ลูกค้าพูดที่อยู่อีเมลของตัวเอง เช่น มาร์เก็ตติ้ง ดอท บรานช์ แอท เคแบงก์ ดอท คอม "
-        "หรือ ซัพพอร์ต แอท ยาฮู ดอท คอม หรือ เฮช อาร์ แอท ทีโอที ดอท ซีโอ ดอท ทีเอช"
+        "ลูกค้าพูดที่อยู่อีเมลของตัวเอง เช่น "
+        "มาร์เก็ตติ้ง ดอท แบรนช์ แอท เคแบงก์ ดอท คอม "
+        "หรือ ซัพพอร์ต แอท ยาฮู ดอท คอม หรือ "
+        "เฮช อาร์ แอท ทีโอที ดอท ซีโอ ดอท ทีเอช "
+        "หรือ เอ็น ที พี แอล ซี ดอท ซีโอ ดอท ทีเอช "
+        "หรือ พี ที ที จี ซี ดอท คอม หรือ โปรตอน ดอท มี"
     )
 
-    segments, info = model.transcribe(
-        audio_path,
-        language=LANGUAGE,
-        beam_size=5,
-        temperature=0,
-        condition_on_previous_text=False,
-        initial_prompt=initial_prompt,
-        # Cut silence before decoding → fewer hallucinations on quiet recordings
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 300},
-        # Enable per-word confidence so we can flag low-confidence transcriptions
-        word_timestamps=True,
-    )
-    text_parts = []
-    all_word_probs = []
-    with __import__('tqdm').tqdm(
-        total=round(info.duration, 2), unit="sec",
-        desc="Transcribe", file=sys.stdout
-    ) as pbar:
+    hotwords_str = _extract_hotwords(ref_text) if ref_text else None
+
+    def _run_transcription(temp: float):
+        segments, info = model.transcribe(
+            audio_path,
+            language=LANGUAGE,
+            beam_size=10,
+            temperature=temp,
+            condition_on_previous_text=False,
+            initial_prompt=initial_prompt,
+            hotwords=hotwords_str,
+            # Cut silence before decoding → fewer hallucinations on quiet recordings
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 200},
+            # Enable per-word confidence so we can flag low-confidence transcriptions
+            word_timestamps=True,
+        )
+        text_parts = []
+        all_word_probs = []
         for seg in segments:
             text_parts.append(seg.text)
-            pbar.update(seg.end - pbar.n)
             if seg.words:
                 for w in seg.words:
                     all_word_probs.append(w.probability)
-    full_text = "".join(text_parts)
+        full_text = "".join(text_parts)
+        avg_word_prob = round(sum(all_word_probs) / len(all_word_probs), 3) if all_word_probs else 1.0
+        return full_text, avg_word_prob
 
-    # Average word-level confidence — low value suggests hallucination
-    avg_word_prob = round(sum(all_word_probs) / len(all_word_probs), 3) if all_word_probs else 1.0
+    full_text, avg_word_prob = _run_transcription(0.0)
 
     if not ref_text or not ref_text.strip():
         return {
@@ -141,6 +142,17 @@ def transcribe_with_model(model, audio_path: str, ref_text: str) -> dict:
             "low_confidence": avg_word_prob < 0.5,
         }
 
+    minilm_score, norm_s_out, norm_a_out = semantic_score(full_text, ref_text)
+
+    # Dual Temperature Retry: if score is low, try temperature=0.2
+    if minilm_score < 70.0:
+        full_text2, avg_word_prob2 = _run_transcription(0.2)
+        minilm_score2, norm_s_out2, norm_a_out2 = semantic_score(full_text2, ref_text)
+        if minilm_score2 > minilm_score:
+            full_text, avg_word_prob, minilm_score = full_text2, avg_word_prob2, minilm_score2
+            norm_s_out, norm_a_out = norm_s_out2, norm_a_out2
+
+    # Calculate diffs
     norm_s = normalize_script(ref_text)
     norm_a = normalize_whisper(full_text)
     ref_tokens = norm_s.split()
@@ -159,8 +171,6 @@ def transcribe_with_model(model, audio_path: str, ref_text: str) -> dict:
             diffs.append({"type": "delete", "ref": " ".join(ref_tokens[i1:i2]), "asr": ""})
         elif tag == "insert":
             diffs.append({"type": "insert", "ref": "", "asr": " ".join(trans_tokens[j1:j2])})
-
-    minilm_score, norm_s_out, norm_a_out = semantic_score(full_text, ref_text)
 
     return {
         "minilm_score": minilm_score,

@@ -12,12 +12,7 @@ venv/
 env/
 
 # Data files (large source files, kept locally)
-data/Email1_qc_report.html
-data/Email2_qc_report.html
-data/Email1.csv
-data/Email2.csv
-data/Email1_qc_results.csv
-data/Email2_qc_results.csv
+data/
 
 # Temp files
 temp_audio/
